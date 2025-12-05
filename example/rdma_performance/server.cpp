@@ -24,12 +24,24 @@
 #include "bvar/variable.h"
 #include "test.pb.h"
 
+#include <fcntl.h>     
+#include <unistd.h>    
+#include <sys/ioctl.h>  
+#include <linux/fs.h> 
+#include <stdlib.h>
+
 #ifdef BRPC_WITH_RDMA
 
 DEFINE_int32(port, 8002, "TCP Port of this server");
 DEFINE_bool(use_rdma, true, "Use RDMA or not");
 
 butil::atomic<uint64_t> g_last_time(0);
+
+const
+const double K_TEST_RATIO = 0.1;
+const uint64_t K_MAX_BYTES_LIMIT = 0;
+int g_disk_fd = -1;
+uint64_t g_max_offset = 0;
 
 namespace test {
 class PerfTestServiceImpl : public PerfTestService {
@@ -42,6 +54,7 @@ public:
               PerfTestResponse* response,
               google::protobuf::Closure* done) {
         brpc::ClosureGuard done_guard(done);
+        // 统计CPU使用率，每100ms更新一次
         uint64_t last = g_last_time.load(butil::memory_order_relaxed);
         uint64_t now = butil::monotonic_time_us();
         if (now > last && now - last > 100000) {
@@ -53,10 +66,37 @@ public:
         } else {
             response->set_cpu_usage("");
         }
-        if (request->echo_attachment()) {
-            brpc::Controller* cntl =
-                static_cast<brpc::Controller*>(cntl_base);
-            cntl->response_attachment().append(cntl->request_attachment());
+
+        if (g_disk_fd < 0) {
+            LOG(ERROR) << "Disk not initialized!";
+            return;
+        }
+
+        static thread_local void* tls_buf = nullptr;
+        static thread_local size_t tls_buf_cap = 0;
+        
+        brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
+        size_t io_size = cntl->request_attachment().size();
+        if (tls_buf == nullptr || tls_buf_cap < io_size) {
+            if (tls_buf) free(tls_buf); // 释放旧的（如果太小）
+            
+            // 申请新的对齐内存
+            if (posix_memalign(&tls_buf, 4096, io_size) != 0) {
+                LOG(ERROR) << "Memory allocation failed";
+                return;
+            }
+            tls_buf_cap = io_size; // 记录当前容量
+        }
+        cntl->request_attachment().copy_to(tls_buf, io_size);
+
+        uint64_t offset = rand() % (g_max_offset - io_size);
+        offset = (offset / 4096) * 4096;
+
+        ssize_t ret = pwrite(g_disk_fd, tls_buf, io_size, offset);
+
+        if (ret < 0) {
+            LOG(ERROR) << "Disk write failed, ret=" << ret;
+            return;
         }
     }
 };
@@ -64,6 +104,43 @@ public:
 
 int main(int argc, char* argv[]) {
     GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
+
+    // --- 【NVMe 初始化逻辑】 ---
+    // O_RDWR: 读写模式
+    // O_DIRECT: 绕过 Page Cache，直接测硬件
+    g_disk_fd = open(K_DISK_PATH, O_RDWR | O_DIRECT);
+    if (g_disk_fd < 0) {
+        LOG(ERROR) << "Fatal: Failed to open " << K_DISK_PATH 
+                   << ". Please check permission (sudo?) or device name.";
+        return -1;
+    }
+
+    uint64_t disk_physical_size = 0;
+    if (ioctl(g_disk_fd, BLKGETSIZE64, &disk_physical_size) < 0) {
+        LOG(ERROR) << "Failed to get disk size";
+        close(g_disk_fd);
+        return -1;
+    }
+
+    // 计算测试范围
+    if (K_MAX_BYTES_LIMIT > 0) {
+        // 如果设置了固定大小，优先使用
+        g_max_offset = K_MAX_BYTES_LIMIT;
+        LOG(INFO) << "Test Mode: Fixed Size (" << g_max_offset / 1024 / 1024 / 1024 << " GB)";
+    } else {
+        // 否则使用比例
+        g_max_offset = disk_physical_size * K_TEST_RATIO;
+        LOG(INFO) << "Test Mode: Ratio (" << K_TEST_RATIO * 100 << "%)";
+    }
+
+    // 不要超过物理磁盘大小
+    if (g_max_offset > disk_physical_size) {
+        g_max_offset = disk_physical_size;
+    }
+
+    LOG(INFO) << "Disk Init Success. Target: " << K_DISK_PATH;
+    LOG(INFO) << "Max LBA Offset: " << g_max_offset << " bytes";
+    // -------------------------
 
     brpc::Server server;
     test::PerfTestServiceImpl perf_test_service_impl;
