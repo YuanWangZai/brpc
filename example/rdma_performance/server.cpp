@@ -37,7 +37,7 @@ DEFINE_bool(use_rdma, true, "Use RDMA or not");
 
 butil::atomic<uint64_t> g_last_time(0);
 
-const
+const char* K_DISK_PATH = "/dev/nvme1n1";
 const double K_TEST_RATIO = 0.1;
 const uint64_t K_MAX_BYTES_LIMIT = 0;
 int g_disk_fd = -1;
